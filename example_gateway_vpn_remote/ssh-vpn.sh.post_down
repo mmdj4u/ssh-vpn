@@ -1,0 +1,101 @@
+#!/bin/bash
+# post_down hook script to disable gateway VPN.
+set -e
+
+# Uncomment this to debug
+# set -x
+
+REMOTE_USER=$1
+REMOTE_HOST=$2
+REMOTE_PORT=$3
+LOCAL_TUNNEL_INTERFACE=$4
+LOCAL_TUNNEL_ADDRESS=$5
+REMOTE_TUNNEL_INTERFACE=$6
+REMOTE_TUNNEL_ADDRESS=$7
+PRIV_KEY_PATH=$8
+LOG_FACILITY=$9
+
+# Source the lib.sh functions
+THIS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+source "${THIS_DIR}"/../lib.sh
+
+set +e
+OUR_BEST_GUESS_DEFAULT_ROUTE="$(get_default_route)"
+set -e
+
+if [ -z "${OUR_BEST_GUESS_DEFAULT_ROUTE}" ]; then
+    ip route delete $(get_route ${REMOTE_HOST})
+else
+    set +e
+    EGRESS_INTERFACE="$(get_egress_interface ${OUR_BEST_GUESS_DEFAULT_ROUTE})"
+    if [ -z "${EGRESS_INTERFACE}" ]; then
+        >&2 echo "Unable to identify egress interface."
+        exit 1
+    fi
+
+    NEXTHOP="$(get_nexthop ${OUR_BEST_GUESS_DEFAULT_ROUTE})"
+    if [ -z "${NEXTHOP}" ]; then
+        >&2 echo "Unable to identify next hop address."
+        exit 1
+    fi
+    set -e
+
+    # Set DNS back to the way it was.
+    # Using symlinks for resolv.conf is a good strategy because, at this time, NetworkManager is a
+    # pretty ubiquitous management tool and it doesn't mess with resolv.conf if resolv.conf is a
+    # symlink. This affords us an opportunity to temporarily manage resolv.conf.
+    VPN_RESOLV_CONF_PATH="/etc/resolv.conf.ssh-vpn"
+    ORIG_RESOLV_CONF_PATH="/etc/resolv.conf.ssh-vpn-backup"
+    if [ -L "/etc/resolv.conf" ] && \
+        [ "$(readlink -f /etc/resolv.conf)" == "${VPN_RESOLV_CONF_PATH}" ]; then
+        echo "Removing VPN resolver and restoring original."
+        if [ -f "${ORIG_RESOLV_CONF_PATH}" ]; then
+            rm -f /etc/resolv.conf
+            mv "${ORIG_RESOLV_CONF_PATH}" /etc/resolv.conf
+            rm -f "${VPN_RESOLV_CONF_PATH}"
+        else
+            echo "resolv.conf backup appears to be missing. Doing nothing with resolv.conf."
+        fi
+    else
+        echo "VPN resolv.conf not detected, so doing nothing with resolv.conf."
+        echo "Removing host routes for nameservers."
+        NS_ADDRESSES="$(get_nameserver_addresses)"
+        for NS_ADDRESS in ${NS_ADDRESSES}; do
+            echo "Removing the host route for nameserver, ${NS_ADDRESS}."
+            set +e
+            ip route delete "${NS_ADDRESS}" via "${NEXTHOP}" dev "${EGRESS_INTERFACE}"
+            set -e
+        done
+    fi
+
+    # Remove a host route for the REMOTE_HOST with egress of the physical interface (control route).
+    echo "Removing the VPN control route."
+    set +e
+    ip route delete "${REMOTE_HOST}" via "${NEXTHOP}" dev "${EGRESS_INTERFACE}"
+    set -e
+
+    # Disable IP forwarding on the target host.
+    # There is no harm in running this over and over again.
+    echo "Disabling routing on the remote."
+    do_remote_command echo 0 '>' /proc/sys/net/ipv4/ip_forward
+
+    # Disable MASQUERADE on the target host.
+    echo "Disabling PAT on the remote."
+    disable_remote_masquerade "0.0.0.0/0" "${MASQ_EGRESS_INTERFACE}"
+
+    set +e
+    echo "Restoring remote iptables."
+    enable_remote_iptables
+    set -e
+
+    # Removing host routes for remote session(s)
+    SESSION_IP4S="$(get_remote_client_ip4)"
+    if [ ! -z "${SESSION_IP4S}" ]; then
+        set +e
+        for IP4 in ${SESSION_IP4S}; do
+            echo "Removing host route for ${IP4}."
+            ip route delete "${IP4}" via "${NEXTHOP}" dev "${EGRESS_INTERFACE}"
+        done
+        set -e
+    fi
+fi

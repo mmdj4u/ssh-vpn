@@ -1,0 +1,44 @@
+#!/bin/bash
+# pre_up hook script for the SSH VPN for checking the status of gateway routing
+set -e
+
+# Uncomment this to debug
+# set -x
+
+REMOTE_USER=$1
+REMOTE_HOST=$2
+REMOTE_PORT=$3
+LOCAL_TUNNEL_INTERFACE=$4
+LOCAL_TUNNEL_ADDRESS=$5
+REMOTE_TUNNEL_INTERFACE=$6
+REMOTE_TUNNEL_ADDRESS=$7
+PRIV_KEY_PATH=$8
+LOG_FACILITY=$9
+
+# Source the lib.sh functions
+THIS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+source "${THIS_DIR}"/../lib.sh
+
+# Get the configuration.
+# We need the user's preferred ping host.
+THIS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+source "${THIS_DIR}"/configuration.sh
+
+if [ -z "${PING_HOST}" ]; then
+    PING_HOST="8.8.8.8"
+fi
+
+GW_FOR_PING_HOST="$(get_route ${PING_HOST} | awk '{print $3}')"
+
+if [ "${GW_FOR_PING_HOST}" == "${REMOTE_TUNNEL_ADDRESS}" ]; then
+    ping -c1 "${PING_HOST}" > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        echo "Traffic is properly tunneled."
+    else
+        echo "Traffic routing is properly set up, but unable to detect if routing is functioning."
+    fi
+else
+    echo "Traffic is NOT properly tunneled!"
+fi
+
+exit ${RET_CODE}

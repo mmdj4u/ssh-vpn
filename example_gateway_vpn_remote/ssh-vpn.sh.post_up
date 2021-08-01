@@ -1,0 +1,173 @@
+#!/bin/bash
+# post_up hook script to enable the use of the VPN for all IP traffic EXCEPT the SSH traffic
+# between this host and the target host (a.k.a the control traffic). This is commonly known as a
+# gateway VPN.
+#
+# This script assumes the behavior of NetworkManager related to /etc/resolv.conf. NetworkManager
+# won't manage /etc/resolv.conf if /etc/resolv.conf is a symlink. This script uses a symlink to
+# temporarily manage /etc/resolv.conf if TUNNEL_DNS=1 in configuration.sh.
+#
+# WARNING! This example will attempt to create a host route to your interactive session machine via
+# the first default route listed in "ip route". The purpose of this route is to ensure that if you
+# are executing this script via a remote shell session, ssh, that you won't lose your session when
+# the new default route is installed. This is not a problem unless the machine on which you are
+# running this script has more than one interface AND you are executing this from a remote shell AND
+# your remote shell is connected to an interface that is NOT the first default gateway listed in
+# "ip route".
+#
+# WARNING! This example assumes that the target host is reachable via the first default gateway
+# interface listed in "ip route".
+#
+# WARNING! This example will assume the first default route in "ip route" when attempting to find a
+# more desireable route metric for the new default route.
+#
+# WARNING! This example will modify your resolver if configuration.sh has TUNNEL_DNS=1. The
+# post_down script should put everything back the way it was.
+#
+# WARNING! This exmaple will add host routes to the routing table to ensure continued name
+# resolution if configuration.sh TUNNEL_DNS!=1. This script will assume that the egress interface
+# to reach these hosts is the egress interface for the first default route listed in "ip route".
+#
+set -e
+
+# Uncomment this to debug
+# set -x
+
+REMOTE_USER=$1
+REMOTE_HOST=$2
+REMOTE_PORT=$3
+LOCAL_TUNNEL_INTERFACE=$4
+LOCAL_TUNNEL_ADDRESS=$5
+REMOTE_TUNNEL_INTERFACE=$6
+REMOTE_TUNNEL_ADDRESS=$7
+PRIV_KEY_PATH=$8
+LOG_FACILITY=$9
+
+# Source the lib.sh functions
+THIS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+source "${THIS_DIR}"/../lib.sh
+
+set +e
+OUR_BEST_GUESS_DEFAULT_ROUTE="$(get_default_route)"
+set -e
+
+if [ -z "${OUR_BEST_GUESS_DEFAULT_ROUTE}" ]; then
+    # No gateway route exists on this host. We just need to add a pinhole route and a default route.
+    ip route add $(get_route ${REMOTE_HOST})
+    ip route add default via "${REMOTE_TUNNEL_ADDRESS}" dev tun"${LOCAL_TUNNEL_INTERFACE}"
+else
+    set +e
+    EGRESS_INTERFACE="$(get_egress_interface ${OUR_BEST_GUESS_DEFAULT_ROUTE})"
+    if [ -z "${EGRESS_INTERFACE}" ]; then
+        >&2 echo "Unable to identify egress interface."
+        exit 1
+    fi
+
+    NEXTHOP="$(get_nexthop ${OUR_BEST_GUESS_DEFAULT_ROUTE})"
+    if [ -z "${NEXTHOP}" ]; then
+        >&2 echo "Unable to identify next hop address."
+        exit 1
+    fi
+    if [ "${NEXTHOP}" == "${REMOTE_TUNNEL_ADDRESS}" ]; then
+        >&2 echo "Default route is already tunneled."
+        exit 1
+    fi
+
+    MASQ_EGRESS_INTERFACE=$(get_remote_default_egress_interface)
+    if [ -z "${MASQ_EGRESS_INTERFACE}" ]; then
+        >&2 echo "Unable to identify masquerade interface."
+        exit 1
+    fi
+    set -e
+
+    # Create a host route for the REMOTE_HOST with egress of the physical interface. This route is
+    # necessary to ensure that the SSH tunnel doesn't collapse when the default route is injected.
+    # This won't automatically revert on VPN down.
+    echo "Adding VPN control route."
+    set +e
+    ip route add $(get_route ${REMOTE_HOST})
+    if [ $? -ne 0 ]; then
+        >&2 echo "Unable to inject VPN control route."
+        exit 1
+    fi
+    set -e
+
+    # Make the current geteway route less desireable if already at minimum (0).
+    # There is no harm in running this over and over again.
+    echo "Incrementing the current default route metric if it is 0."
+    increment_metric_if_minimum "${OUR_BEST_GUESS_DEFAULT_ROUTE}"
+
+    # Enable IP forwarding on the target host
+    # This won't automatically revert on VPN down.
+    # There is no harm in running this over and over again.
+    echo "Enabling routing on the remote."
+    do_remote_command echo 1 '>' /proc/sys/net/ipv4/ip_forward
+
+    # TODO 4: Enable MASQUERADE on the target host
+    # This won't automatically revert on VPN down.
+    echo "Enabling PAT on the remote."
+    enable_remote_masquerade "0.0.0.0/0" "${MASQ_EGRESS_INTERFACE}"
+
+    # Create a zero route with a preferred metric out the tun interface.
+    # There is no harm in running this over and over again.
+    echo "Adding a new default route to direct all non-control traffic through the VPN with metric 0."
+    set +e
+    ip route add default via "${REMOTE_TUNNEL_ADDRESS}" dev tun"${LOCAL_TUNNEL_INTERFACE}" metric 0
+    if [ $? -ne 0 ]; then
+        >&2 echo "Unable to add new default route."
+        exit 1
+    fi
+    set -e
+
+    # Get the configuration.
+    # We need the user's DNS preferences.
+    # Using symlinks for resolv.conf is a good strategy because, at this time, NetworkManager is a
+    # pretty ubiquitous management tool and it doesn't mess with resolv.conf if resolv.conf is a
+    # symlink. This affords us an opportunity to temporarily manage resolv.conf.
+    THIS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+    source "${THIS_DIR}"/configuration.sh
+
+    if [ "${TUNNEL_DNS}" == "1" ]; then
+        if [ -z "${DNS_SERVERS}" ]; then
+            >&2 echo "TUNNEL_DNS=1 and DNS_SERVERS is null. Name resolution will not be possible."
+        fi
+        echo "Tunneling of DNS request is enabled (secure). Modifying resolver."
+        NEW_RESOLV_CONF_PATH="/etc/resolv.conf.ssh-vpn"
+        > ${NEW_RESOLV_CONF_PATH}
+        for DNS_SERVER in ${DNS_SERVERS}; do
+            echo "nameserver ${DNS_SERVER}" >> ${NEW_RESOLV_CONF_PATH}
+        done
+
+        if [ ! -z "${DNS_SEARCH}" ]; then
+            echo "search ${DNS_SEARCH}" >> ${NEW_RESOLV_CONF_PATH}
+        fi
+
+        if [ -L "/etc/resolv.conf" ]; then
+            RESOLV_CONF_ACTUAL_FILE="$(readlink -f /etc/resolv.conf)"
+            if [ "${RESOLV_CONF_ACTUAL_FILE}" != "/etc/resolv.conf.ssh-vpn-backup" ]; then
+                cp "${RESOLV_CONF_ACTUAL_FILE}" /etc/resolv.conf.ssh-vpn-backup
+            fi
+
+            rm -f /etc/resolv.conf
+        else
+            mv /etc/resolv.conf /etc/resolv.conf.ssh-vpn-backup
+        fi
+
+        ln -s "${NEW_RESOLV_CONF_PATH}" /etc/resolv.conf
+    else
+        # The user wants to use local DNS (not as secure), so we need host routes to ensure reachability
+        # to the nameservers
+        echo "Tunneling of DNS is disabled (INSECURE). Creating routes for DNS addresses."
+        NS_ADDRESSES="$(get_nameserver_addresses)"
+        for NS_ADDRESS in ${NS_ADDRESSES}; do
+            echo "Creating host route for nameserver, ${NS_ADDRESS}."
+            set +e
+            ip route add "${NS_ADDRESS}" via "${NEXTHOP}" dev "${EGRESS_INTERFACE}"
+            if [ $? -ne 0 ]; then
+                >&2 echo "Unable to inject host route for DNS server."
+                exit 1
+            fi
+            set -e
+        done
+    fi
+fi

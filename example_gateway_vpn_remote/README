@@ -1,0 +1,16 @@
+TODO: this example seems to be in a working state. Next steps are to review this for robustness.
+
+In this configuration Host A accesses the Internet via the gateway attached to Host B. This is a
+common VPN used when the local network to which Host A is connected is completely untrusted. This
+example includes a configuration option to send DNS queries through the VPN also for even better
+security.
+
+#######################                                    #######################
+##      Host A       ##                                    ##      Host B       ##
+##    (this host)    ##~~~~~~~~~~~~~~SSH Tunnel~~~~~~~~~~~~##    REMOTE_HOST    ##
+##                   ##-----|                        |-----##                   ##-----|
+##       172.18.2.1/30-tun21|<-------DIRECT IP------>|tun21-172.18.2.2/30          eth0|
+##     INTERNET TRAFFIC<----|------------------------|---------------------------------|-->GATEWAY
+##                   ##-----|                        |-----##                   ##-----|
+##     ssh-vpn.sh    ##~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~##       sshd        ##
+#######################                                    #######################

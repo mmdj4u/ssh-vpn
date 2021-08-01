@@ -1,0 +1,165 @@
+PURPOSE:
+The aim of ssh-vpn.sh is to connect any two hosts as if they were directly connected to one another
+via a physical network cable. This is accomplished using an IP network and openssh on the hosts.
+ssh-vpn.sh features VPN hooks to extend the functionality once a base circuit is established,
+automatic maximum transmission unit, MTU, discovery of the tunnel, and automatic configuration of
+the VPN on both ends of the connection.
+
+To be clear, ssh-vpn.sh on its own ONLY creates the authenticated and encrypted base circuit to
+place the two hosts on the same subnetwork, "layer 3 adjacent". Any additional functionality that
+is needed beyond the base circuit is implemented through the use of hooks. Please see HOOKS below
+for more information about how to use hooks. Some example hooks are available for common VPN use
+cases.
+
+
+USAGE:
+1) Modify the values of the variables in the CONFIGURATION BLOCK in ssh-vpn.sh.
+2) Run the script.
+   sudo ./ssh-vpn.sh up
+
+
+REQUIREMENTS:
+1) IP connectivity between the two hosts is a bit of a soft requirement. There are some alternative
+   configurations that are possible as well (see the TESTED CONFIGURATION section below), but for
+   basic usage, IP connectivity between the two hosts is required.
+2) SSH between the hosts (one client and one daemon) is a hard requirement.
+   a. While not required, the user experience of ssh-vpn.sh will be much better with public/private
+      key authentication or SSHCA authentication.
+3) The node hosting sshd MUST have PermitTunnel = yes configured in sshd_config. By default, this
+   parameter is "no". If you need to change it, don't forget to restart sshd.
+4) Both hosts MUST support kernel tun devices. There is a command line argument for ssh-vpn.sh to
+   do this check for you. Run ssh-vpn.sh with -h for more information. ssh-vpn.sh will make an
+   attempt to automatically load kernel tun support on both hosts.
+5) The user account used to run ssh-vpn.sh must have permission to create network interfaces. In
+   most cases this is at least a sudoer. If you get errors running this as an unprivileged user, you
+   may try running as root. NOTE: This is also true for the remote end of the tunnel since a tun
+   interface must be created on both ends.
+6) This tool uses command line tools found in the iproute2 package to configure the tunnel
+   interface. This is true for both hosts.
+
+
+HOOKS:
+You may define some pre_up, post_up, pre_down, post_down, and status scripts. To do so, create a
+script in a directory called hooks at the same level as ssh-vpn.sh. Each hook script must have the
+same name as ssh-vpn.sh except that it has an additional extention of .pre_up, .post_up, .pre_down,
+.post_down, or .status. For example, if ssh-vpn.sh is ssh-vpn.sh and you wanted to create a pre_up
+script, you would name your script ssh-vpn.sh.pre_up. Your hook script will receive several command
+line arguments from ssh-vpn.sh when called. The example hook scripts will provide a list of the
+arguments passed into the scripts. These hooks can be useful for:
+ - (un)loading kernel modules
+ - enabling/disabling routing support and (post)routing rules
+ - enabling/disabling other interfaces
+ - setting up/shutting down applications on circuit initialization/shutdown
+ - logging
+ - really anything you can think of
+
+You have two opions to get started with hooks to privide additional VPN functionality. The first
+option would be to copy the hooks_template directory to a new directory for your application. This
+option really provides you a starting point, a clean slate:
+
+$ cp hooks_template  my_awesome_vpn
+
+The other options is to copy or modify (or just use for that matter if it works for you) one of the
+examples. If you desire a gateway VPN and the exmaple "just works", then all you have to do is:
+
+$ ln -s example_gateway_vpn hooks
+$ sudo ./ssh-vpn.sh up
+
+NOTE: The hook examples are provided for convenience. There exists a wide variety of systems and
+configurations within the Linux world. Therefore, the examples provided are meant to be a starting
+point. It is highly likely that you may run in to trouble. However, at least you won't have to
+start from scratch. The scripts are meant to provide a framework for success, though you'll need
+to familiarize yourself with the examples and solve any problems that may arise. No claim is being
+made that the examples will "just work". In fact, it is quite possible that they won't. In the
+examples, effort was made to 1) provide great documentation about high level system requirements
+to make the VPN configuration work and 2) provide some convenience functions for common needs such
+as performing a remote procedure call (see lib.sh).
+
+Example hooks directory structure:
+./
+-> ssh-vpn.sh
+-> hooks/
+   -> ssh-vpn.sh.pre_up
+   -> ssh-vpn.sh.post_down
+
+Here's another example for a hooks directory structure that supports multiple VPN configurations.
+In this case, hooks is a symlink that points to the gateway_vpn_hooks directory. This structure
+allows flexibility as to how the VPN will function. To change the behavior of the VPN, simply
+symlink to the appropriate hooks directory:
+./
+- ssh-vpn.sh
+- hooks -> gateway_vpn_hooks
+- gateway_vpn_hooks/
+   - ssh-vpn.sh.pre_up
+   - ssh-vpn.sh.post_down
+- split_tunnel_hooks/
+   - configuration.sh
+   - ssh-vpn.sh.pre_up
+   - ssh-vpn.sh.post_up
+   - ssh-vpn.sh.post_down
+
+Hook scripts can be implemented in any number of ways. Some examples call out for a configuration.sh
+file which can be sourced from any of the hook scripts. However, this is not required by ssh-vpn.sh.
+ssh-vpn.sh only executes scripts with the same name (ssh-vpn.sh) with an additional extension as
+stated earlier. ssh-vpn.sh ignores any other files in the hooks directory.
+
+Here's a helpful tip. When creating a hook script and doing some automation on the remote host via
+SSH, you can make use of the control socket that ssh-vpn.sh creates which will dramatically
+improve performance of your remote procedure calls. All of the examples make use of this feature via
+the do_remote_command function in lib.sh.
+NOTE: This does NOT work for post_down scripts. Here's the boiler plate to use the control socket:
+ssh -S "${HOME}/.ssh/%C" $REMOTE_USER@$REMOTE_HOST echo "hello world"
+Again, this is just for your information if you choose not to use the do_remote_command function
+within lib.sh.
+
+BASIC DIAGRAM:
+#######################                                    #######################
+##      Host A       ##                                    ##      Host B       ##
+##    (this host)    ##~~~~~~~~~~~~~~SSH Tunnel~~~~~~~~~~~~##    REMOTE_HOST    ##
+##                   ##-----|                        |-----##                   ##
+##       172.18.2.1/30-tun21|<-------DIRECT IP------>|tun21-172.18.2.2/30       ##
+##                   ##-----|                        |-----##                   ##
+##     ssh-vpn.sh    ##~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~##       sshd        ##
+#######################                                    #######################
+
+- You may notice the tun interfaces on each host. Those do NOT need to be pre-created. Only the
+steps identified in the usage above should be necessary to get this working. SSH will create the
+tun interfaces on both hosts and will tear them down automatically.
+- You may notice that the two tun0 interfaces on the hosts are on the same subnetwork. That is the
+point of ssh-vpn.sh. There is value in having direct IP connectivity, meaning same subnet
+connectivity or layer 3 adjacency, between two hosts. ssh-vpn.sh makes that direct connectivity
+possible even if direct physical connectivity is not possible. For example, Host A may be in New
+York while Host B is in Hong Kong.
+- There are numerous possibilities for things you may want to do once you have direct same subnet
+connectivity (a.k.a layer 3 adjacency) between two hosts. This tool allows for extended
+functionality via hook scripts. See HOOKS for more information.
+
+
+TESTED CONFIGURATION (target host is not directly reachable via IP):
+#######################                                    #######################
+##      Host A       ##                                    ##      Host B       ##
+##    (this host)    ##~~~~~~~~~~~~~~SSH Tunnel~~~~~~~~~~~~~~    REMOTE_HOST    ~~~~~~~~~~~~~~~~~~
+##                   ##-----|                          <-proxy/2222--(target host)/22->          ~
+##       172.18.2.1/30-tun21|<-------DIRECT IP-----------------------------------------------    ~
+##                   ##-----|                                                               -    ~
+##     ssh-vpn.sh    ##~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~     socat/nc      ~~~~~~~~~   -    ~
+#######################                                    #######################      ~   -    ~
+                                                           #######################      ~   -    ~
+                                                           ##      Host C       ##      ~   -    ~
+                                                           ##   (target host)   ##~~~~~~~   -    ~
+                                                           ##                   ##-----|    -    ~
+                                                           ##       172.18.2.2/30-tun21|<----    ~
+                                                           ##                   ##-----|         ~
+                                                           ##       sshd        ##~~~~~~~~~~~~~~~~
+                                                           #######################
+
+In this configuration Host A connects to Host C through a transit or proxy host, Host B. Host B is
+relaying its port 2222 to Host C's 22. This enables Host A to reach Host C via SSH even though it
+does not have direct IP access to Host C. This is a use full configuration if Host C is on a
+network segment that is otherwise unreachable to Host A. For this to work you'd have to first set
+up the relay on Host B. You can use a number of utilities to accomplish this. Socat, netcat or nc,
+and even SSH can do this. Once the relay is set up, you'd have to modify the REMOTE_PORT in the
+CONFIGURATION BLOCK to the relay port 2222. The value of REMOTE_HOST in the CONFIGURATION BLOCK
+would be the routable address for Host B (NOT Host C). Once finished, Host A and Host C will be
+"directly" connected to the same subnet.
+

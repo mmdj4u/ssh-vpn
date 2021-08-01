@@ -1,0 +1,35 @@
+#!/bin/bash
+# pre_up hook script for the SSH gateway VPN
+set -e
+
+# Uncomment this to debug
+# set -x
+
+REMOTE_USER=$1
+REMOTE_HOST=$2
+REMOTE_PORT=$3
+LOCAL_TUNNEL_INTERFACE=$4
+LOCAL_TUNNEL_ADDRESS=$5
+REMOTE_TUNNEL_INTERFACE=$6
+REMOTE_TUNNEL_ADDRESS=$7
+PRIV_KEY_PATH=$8
+LOG_FACILITY=$9
+
+#set +e
+#ping -c 1 "${REMOTE_HOST}" > /dev/null 2>&1
+#if [ $? -ne 0 ]; then
+#    echo "Remote is not reachable."
+#    exit 1
+#fi
+#set -e
+
+# Source the lib.sh functions
+THIS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+source "${THIS_DIR}"/../lib.sh
+
+set +e
+echo "Disabling remote iptables."
+disable_remote_iptables
+set -e
+
+exit $?
